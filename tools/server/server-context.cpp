@@ -4121,36 +4121,53 @@ private:
                                             ssd_lcp >= (int32_t)ssd_n_tokens ||
                                             (ssd_lcp >= (int32_t)KV_SSD_TOKEN_PREFIX_MAX
                                              && ssd_overlap >= 0.99f));
-                                        if (!full_coverage && lcp_ratio < MIN_LCP_RATIO) {
-                                            SLT_WRN(slot, "cold-start: rejecting SSD checkpoint for hybrid model "
-                                                    "(lcp=%d < 80%% of validated=%lu/n_tokens=%lu, ratio=%.1f%%, overlap=%.1f%%)\n",
+                                        // A recurrent state cannot be truncated. It is a single
+                                        // fixed-size tensor produced by folding in exactly the
+                                        // tokens the checkpoint was captured over, so it is
+                                        // valid at that one length and nowhere else. There is no
+                                        // representation of "the same state, 200 tokens earlier".
+                                        //
+                                        // The old "cap n_past to the LCP" branch could not work:
+                                        // llama_memory_seq_rm_attn_only() deliberately preserves
+                                        // the recurrent R/S data (see its comment) and only
+                                        // clears attention cells and stale positions, so after
+                                        // capping, the GDN layers still carry the state of
+                                        // ssd_n_tokens tokens while the server believes only
+                                        // ssd_lcp are cached. Generation then continues from a
+                                        // state that encodes the *previous* turn's text, which
+                                        // biases the model straight back onto the tokens it just
+                                        // produced - an agent that repeats one tool call forever.
+                                        //
+                                        // So for recurrent/hybrid contexts accept full coverage
+                                        // or nothing. Reprocessing a trimmed prompt is cheap
+                                        // compared to a wedged agent.
+                                        if (!full_coverage) {
+                                            SLT_WRN(slot, "cold-start: rejecting SSD checkpoint for hybrid model, "
+                                                    "partial coverage cannot be truncated "
+                                                    "(lcp=%d validated=%lu n_tokens=%lu ratio=%.1f%% overlap=%.1f%% partial=%d)\n",
                                                     ssd_lcp, (unsigned long)validated_tokens, (unsigned long)ssd_n_tokens,
-                                                    lcp_ratio * 100.0f, ssd_overlap * 100.0f);
+                                                    lcp_ratio * 100.0f, ssd_overlap * 100.0f, (int)ssd_partial);
                                             // Clear the loaded state and reset
                                             llama_memory_seq_rm(llama_get_memory(ctx_tgt), slot.id, -1, -1);
+                                            if (ctx_dft) {
+                                                llama_memory_seq_rm(llama_get_memory(ctx_dft.get()), slot.id, -1, -1);
+                                            }
                                             n_past = 0;
                                             slot.prompt.tokens.clear();
                                             ssd_n_tokens = 0;
-                                        } else if (!full_coverage) {
-                                            // Partial coverage: cap n_past to LCP so only
-                                            // validated recurrent state is used.
-                                            SLT_INF(slot, "SSD hybrid model partial-coverage: "
-                                                    "lcp=%d ssd_n_tokens=%lu cap to LCP\n",
-                                                    ssd_lcp, (unsigned long)ssd_n_tokens);
-                                            llama_memory_seq_rm_attn_only(
-                                                llama_get_memory(ctx_tgt), slot.id, ssd_lcp, -1);
-                                            // Attention state is only valid up to LCP for hybrid models
-                                            n_past = ssd_lcp;
                                         }
                                     }
 
-                                    // Partial LCP match (dense or hybrid): the restored state
-                                    // is only valid up to the LCP position. Strip stale
-                                    // attention KV beyond ssd_lcp and cap n_past.
-                                    // The hybrid model block above already does this for
-                                    // recurrent models; dense (non-SWA) models fall through
-                                    // here because seq_rm_attn_only == seq_rm for them.
-                                    if (ssd_partial && ssd_lcp > 0 && (uint64_t)ssd_lcp < ssd_n_tokens) {
+                                    // Partial LCP match, dense models only: without a recurrent
+                                    // component the state is per-position, so dropping the
+                                    // attention cells past the LCP really does leave a valid
+                                    // prefix. For recurrent/hybrid contexts the block above has
+                                    // already either accepted full coverage or rejected the
+                                    // checkpoint outright, and ssd_n_tokens is 0 in the reject
+                                    // case - guard on the context type so this can never
+                                    // resurrect a truncated recurrent state.
+                                    if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_RS &&
+                                        ssd_partial && ssd_lcp > 0 && (uint64_t)ssd_lcp < ssd_n_tokens) {
                                         SLT_INF(slot, "SSD cache partial-LCP restore: "
                                                 "lcp=%d ssd_n_tokens=%lu stripping post-LCP attention KV\n",
                                                 ssd_lcp, (unsigned long)ssd_n_tokens);
@@ -4566,17 +4583,27 @@ private:
                                                         (uint32_t)n_sys, sys_data)) {
                                         recovered_n_sys = n_sys;
                                         recovered = true;
-                                    } else if ((uint32_t)n_sys >= MIN_PREFIX_MATCH &&
+                                    } else if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_RS &&
+                                               (uint32_t)n_sys >= MIN_PREFIX_MATCH &&
                                                sys_cache->load_prefix((const uint32_t*)task_tokens.data(),
                                                        (uint32_t)n_sys, MIN_PREFIX_MATCH, sys_data)) {
-                                        // Prefix fallback matched. Use the boundary as
-                                        // n_past - the loaded state's recurrent state covers
-                                        // up to the stored entry's n_tokens, but for hybrid
-                                        // models the state at position N is computed from
-                                        // tokens [0, N). If the first 64+ tokens match we
-                                        // accept the approximate match; any model state drift
-                                        // is bounded by the small divergent region at the
-                                        // boundary.
+                                        // Prefix fallback: the entry matched on its first
+                                        // MIN_PREFIX_MATCH tokens only, so beyond that its tokens
+                                        // may differ from this task's. The old comment here argued
+                                        // the resulting "state drift is bounded by the small
+                                        // divergent region at the boundary" - that is not true for
+                                        // a recurrent state, which is one tensor folded over every
+                                        // token, so a divergence anywhere changes it completely and
+                                        // there is no bounded error. Restoring it and then claiming
+                                        // n_past = n_sys hands the model a state describing another
+                                        // conversation.
+                                        //
+                                        // Disabled for recurrent/hybrid contexts. Note it remains
+                                        // questionable for dense models too - their KV cells would
+                                        // hold the stored entry's keys/values while the server
+                                        // believes the positions hold this task's tokens - but that
+                                        // failure degrades rather than wedges, and changing it is
+                                        // out of scope here.
                                         recovered_n_sys = n_sys;
                                         recovered = true;
                                         SLT_DBG(slot, "[PROBE] sys-cache-fallback prefix-match recovered at n_sys=%d (exact match failed)\n",
