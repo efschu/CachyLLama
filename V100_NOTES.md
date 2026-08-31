@@ -117,7 +117,7 @@ The compose files use `deploy.resources.reservations.devices`, which works.
 
 ## 4. Findings
 
-### 4.1 The hybrid `seq_rm` abort — fixed upstream, do not re-patch it
+### 4.1 The hybrid `seq_rm` abort — and the loops that replaced it
 
 A build from `b9ed083e4` (2026-08-21) died on the **second** request of any
 conversation:
@@ -133,13 +133,77 @@ Path: `server-context.cpp` truncates the warm slot beyond the reused prefix with
 returned `false` for anything longer (a previous turn's generated tokens).
 `common_context_seq_rm` aborts unconditionally on `false`.
 
-Fixed by `b83d23022` (2026-08-22) — *one day after* that checkout — which falls
-through to the regular cell-clearing loop instead of returning `false`. Verified on
-metal: the identical call (`memory_seq_rm [1241, end)`) is taken at `4ec44dc10` and
-does not crash, across plain multi-turn plus tools + streaming + growing history.
+`b83d23022` (2026-08-22 — *one day after* that checkout) made
+`llama_memory_recurrent::seq_rm` fall through to the regular cell-clearing loop
+instead of returning `false`. **That removed the crash without fixing the cause.**
+The cell-clearing loop sets `tail_id = -1`, i.e. it *drops* the sequence's recurrent
+state, while the attention cache keeps the prefix. The server still believes `p0`
+tokens are cached, so the 49 Gated-DeltaNet layers run from a zero state over a long
+context while the 16 attention layers see the full history. The model does not crash;
+it produces confident, repeating nonsense. A loud failure became a silent one.
 
-**Consequence:** any local patch that routes the warm-slot path through
-`llama_memory_seq_rm_attn_only` is obsolete. Don't carry one.
+#### The actual root cause: an inverted gate
+
+`tools/server/server-context.cpp` guards that truncation with a recovery block —
+restore a context checkpoint, else `do_reset` with `n_past = 0`. Upstream:
+
+```c
+if (pos_min >= pos_min_thold) {   // ggml-org/llama.cpp
+```
+
+CachyLLama since `6af265fa1` (2026-08-20, the direct **parent** of `b9ed083e4`):
+
+```c
+if (pos_min <= pos_min_thold) {   // fork
+```
+
+`pos_min` is the lowest position the memory still holds for the sequence — on a hybrid
+it is `max(attn.pos_min, recr.pos_min)`, so it tracks the *recurrent tail*, which sits
+past the LCP whenever the previous turn generated tokens the client does not echo
+back (a dropped `<think>` block does it every single turn). `pos_min_thold` is the
+largest `pos_min` a checkpoint may have and still cover the LCP. The recovery is
+needed exactly when `pos_min` has risen **to or above** the threshold. Inverted, it
+fires in the healthy case and is skipped in the broken one, so execution reaches
+`slot.mem.seq_rm(slot.id, p0, -1)` with a rollback the recurrent cache cannot perform.
+
+The bound is small: `common_params_speculative::need_n_rs_seq()` returns
+`draft.n_max`, so `--spec-draft-n-max 3` means the recurrent cache can roll back
+**3 positions**. Any dropped reasoning block blows through that.
+
+The commit message of `6af265fa1` says the intent was to fix
+`it->pos_min < pos_min_thold` *inside* the `find_if` below — that predicate is
+unchanged and still matches upstream; only the outer gate moved. The stated goal was
+to stop "silently forcing full re-prefill on warm slots".
+
+#### Measured, and fixed on this branch
+
+Identical harness (109 208-token context, five turns, only the visible `content`
+echoed back so the reasoning block is dropped each turn), temperature 0, SSD cache
+cleared before each run — at temperature 0 nothing but the internal state can change
+the output:
+
+| build | t0 | t1 | t2 | t3 | t4 | wrong |
+|---|---|---|---|---|---|---|
+| inverted gate | team-**16** ✗ | 56 | r0 | 144 | **1** ✗ | **2/5** |
+| gate restored (`974af40b3`) | **team-18** ✓ | 56 | r0 | 144 | **0** ✓ | **0/5** |
+
+And the concern that motivated the inversion does not materialise: with the gate
+restored the same run reports `cache_n = 109207`, `prompt_n = 33` — the checkpoint
+ring covers the LCP, so there is **no** full re-prefill.
+
+**Consequences:**
+
+* The operator's `warm-slot-seqrm.patch` was aimed at the right line for the wrong
+  reason. Routing the warm path through `llama_memory_seq_rm_attn_only` hides the
+  symptom; the gate is the cause.
+* Do not run a CachyLLama build between `6af265fa1` and this fix on a hybrid
+  (Gated-DeltaNet / Mamba) model. Before `b83d23022` it crashes; after, it degrades
+  silently.
+* This is not fully proven to be the *only* cause of the loops reported in
+  production: the harness reproduces state corruption and the fix removes it, but the
+  probe questions produce short answers, so corruption shows up as wrong facts rather
+  than runaway repetition. If loops recur on `974af40b3`, capture `-lv 4` and look for
+  `pos_min`, `do_reset` and `memory_seq_rm` lines.
 
 ### 4.2 FlashAttention + quantized KV under `--split-mode tensor`
 

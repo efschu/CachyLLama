@@ -27,7 +27,7 @@
 # `docker compose -f <file> up -d` switches between the three profiles in one command.
 services:
   llama-cpp-qwen36-27b-dual-mtp-vision:
-    image: cachyllama:server-cuda-4ec44dc-sm70-v100
+    image: cachyllama:server-cuda-974af40-sm70-v100
     container_name: "${ESTATE_CONTAINER:-llama-cpp-qwen36-27b-cachyllama-q5_1}"
     shm_size: 16384mb
     restart: no
