@@ -1925,21 +1925,33 @@ std::list<server_prompt_cache_state>::iterator server_prompt_cache::find_evictio
     return it_worst;
 }
 
+// The user id is an optional routing / accounting label. It is hashed with
+// sha256_namespace_key() before it reaches a cache key or the filesystem - the
+// on-disk path is <base>/u/<16 hex digits of that hash>, see
+// server_context_page_manager::get_or_create_user_cache() - so its character set
+// is not a safety boundary.
+//
+// Rejecting the whole request because a client sent an e-mail address, a UUID
+// with dots, or a "tenant:42" style label is therefore strictly worse than
+// accepting it: an optional label must never fail a completion. Sanitize instead
+// of throwing:
+//   - overlong ids are truncated rather than rejected,
+//   - control characters are replaced so they cannot corrupt a log line.
+// Everything else passes through unchanged, which keeps per-user routing
+// injective for any realistic identifier.
 std::string server_task::validate_user_id(std::string user_id) {
     constexpr size_t MAX_USER_ID_LEN = 512;
+
     if (user_id.size() > MAX_USER_ID_LEN) {
-        throw std::invalid_argument(
-            "llama_user_id exceeds maximum length of " + std::to_string(MAX_USER_ID_LEN));
+        user_id.resize(MAX_USER_ID_LEN);
     }
-    for (char c : user_id) {
-        const bool ok = (c >= 'a' && c <= 'z') ||
-                        (c >= 'A' && c <= 'Z') ||
-                        (c >= '0' && c <= '9') ||
-                        c == '-' || c == '_';
-        if (!ok) {
-            throw std::invalid_argument(
-                "llama_user_id must match ^[a-zA-Z0-9\\-_]+$ (empty = anonymous)");
+
+    for (char & c : user_id) {
+        const unsigned char u = (unsigned char) c;
+        if (u < 0x20 || u == 0x7F) {
+            c = '_';
         }
     }
+
     return user_id;
 }
