@@ -119,6 +119,19 @@ static __device__ __forceinline__ void dequantize_q8_0(const void * vx, const in
     v.y *= d;
 }
 
+// iq4_nl uses the same nibble layout as q4_0 (low nibbles first, high nibbles
+// offset by QK4_NL/2), but the codes index a non-linear value table.
+static __device__ __forceinline__ void dequantize_iq4_nl(const void * vx, const int64_t ib, const int iqs, float2 & v){
+    const block_iq4_nl * x = (const block_iq4_nl *) vx;
+
+    const float d = x[ib].d;
+
+    const int vui = x[ib].qs[iqs];
+
+    v.x = d * kvalues_iq4nl[vui & 0xF];
+    v.y = d * kvalues_iq4nl[vui >>  4];
+}
+
 //================================== k-quants
 
 // Each call dequantizes one super-block of QK_K values into y using the

@@ -84,7 +84,7 @@ llama-cli -m model.gguf -sm tensor -ctk f16 -ctv f16
 ```
 
 - `--flash-attn off` or (`--flash-attn auto` resolving to `off` when it isn't supported) is a hard error.
-- KV cache types must be non-quantized: `f32`, `f16`, or `bf16`. Support for quantized KV cache is not implemented and trying to use it will result in an error.
+- KV cache quantization works for every type the CUDA FlashAttention kernels can consume: `f32`, `f16`, `bf16`, `q8_0`, `q4_0`, `q4_1`, `q5_0`, `q5_1`, `iq4_nl`. Types without a compiled FlashAttention *vector* kernel instance (`q4_1`, `q5_0`, `q5_1`, `iq4_nl` in a default build) are served by the tile/MMA kernels, which dequantize K/V to F16 on the fly: correct and fully GPU-resident, but slower than a native instance. Build with `-DGGML_CUDA_FA_ALL_QUANTS=ON` to get native vector kernels for all of them.
 - Mark this configuration as experimental in your tooling: validate output quality before deploying.
 - `--split-mode tensor`is not implemented for all architectures. The following will fail with *"LLAMA_SPLIT_MODE_TENSOR not implemented for architecture '...'"*:
 
@@ -118,7 +118,7 @@ P2P requires driver support (usually restricted to workstation/datacenter GPUs) 
 | Symptom | How to fix |
 |---|---|
 | Startup error *"SPLIT_MODE_TENSOR requires flash_attn to be enabled"* | Add `-fa on` or remove `-fa off`. |
-| Startup error *"simultaneous use of SPLIT_MODE_TENSOR and KV cache quantization not implemented"* | Use `-ctk f16 -ctv f16` (or `bf16`/`f32`) with `--split-mode tensor`. |
+| Startup abort *"GGML_ASSERT(ret.axis != GGML_BACKEND_SPLIT_AXIS_UNKNOWN) failed"* in `ggml-backend-meta.cpp` | A graph node could not be placed on the split devices. This happens when the backend reports an op/type combination as unsupported: with the other split modes the scheduler silently offloads such a node to the CPU, but under `tensor` there is no valid split state for it. Check `--cache-type-k`/`--cache-type-v` first, then report the log upstream. |
 | Startup error *"LLAMA_SPLIT_MODE_TENSOR not implemented for architecture 'X'"* | Architecture not on the TENSOR allow-list. Use `--split-mode layer`. |
 | Warning *"NCCL is unavailable, multi GPU performance will be suboptimal"* | llama.cpp wasn't built with NCCL. Either accept the lower performance or install NCCL and rebuild. |
 | CUDA OOM at startup or during prefill in `--split-mode tensor` | Auto-fit is disabled in this mode, so reduce memory pressure yourself. In order from least to most disruptive: lower `--ctx-size` (`-c`) (KV cache is roughly proportional to `n_ctx`); for `llama-server`, lower `--parallel` (`-np`) (a slot KV cache is allocated per concurrent sequence); as a last resort, reduce `--n-gpu-layers` (`-ngl`) (the remaining layers run on CPU and inference will be much slower). |

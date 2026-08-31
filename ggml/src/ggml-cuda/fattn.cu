@@ -335,23 +335,61 @@ enum best_fattn_kernel {
     BEST_FATTN_KERNEL_MMA_F16 = 400,
 };
 
+// The FlashAttention vector kernels are templated on (type_K, type_V) and only a
+// subset of the instances is compiled unless GGML_CUDA_FA_ALL_QUANTS is set.
+static bool ggml_cuda_fattn_vec_type_available(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_F32: // routed to the F16 instance by FATTN_VEC_CASE
+        case GGML_TYPE_F16:
+        case GGML_TYPE_BF16:
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q8_0:
+            return true;
+        case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0:
+        case GGML_TYPE_Q5_1:
+#ifdef GGML_CUDA_FA_ALL_QUANTS
+            return true;
+#else
+            return false;
+#endif // GGML_CUDA_FA_ALL_QUANTS
+        default:
+            return false;
+    }
+}
+
+static bool ggml_cuda_fattn_vec_case_available(ggml_type type_K, ggml_type type_V) {
+    if (!ggml_cuda_fattn_vec_type_available(type_K) || !ggml_cuda_fattn_vec_type_available(type_V)) {
+        return false;
+    }
+
+#ifndef GGML_CUDA_FA_ALL_QUANTS
+    // only the same-type instances are compiled, F32 is read through the F16 instance
+    const ggml_type tk = type_K == GGML_TYPE_F32 ? GGML_TYPE_F16 : type_K;
+    const ggml_type tv = type_V == GGML_TYPE_F32 ? GGML_TYPE_F16 : type_V;
+
+    if (tk != tv) {
+        return false;
+    }
+#endif // GGML_CUDA_FA_ALL_QUANTS
+
+    return true;
+}
+
+// The tile and MMA kernels dequantize K and V to F16 up front (need_f16_K /
+// need_f16_V in launch_fattn), so a KV type without a vector kernel instance is
+// still usable as long as it has a dequantization kernel. Reporting it as
+// unsupported instead pushes the node onto the CPU backend, which is not only
+// orders of magnitude slower but outright impossible with LLAMA_SPLIT_MODE_TENSOR,
+// where the meta backend cannot infer a split axis for a node it does not own and
+// aborts in ggml_backend_meta_split_state().
 static bool ggml_cuda_fattn_kv_type_supported(ggml_type type) {
     switch (type) {
         case GGML_TYPE_F32:
         case GGML_TYPE_F16:
             return true;
-        case GGML_TYPE_Q4_1:
-        case GGML_TYPE_Q5_0:
-        case GGML_TYPE_Q5_1:
-#ifndef GGML_CUDA_FA_ALL_QUANTS
-            return false;
-#endif // GGML_CUDA_FA_ALL_QUANTS
-        case GGML_TYPE_Q4_0:
-        case GGML_TYPE_Q8_0:
-        case GGML_TYPE_BF16:
-            return true;
         default:
-            return false;
+            return ggml_get_to_fp16_nc_cuda(type) != nullptr;
     }
 }
 
@@ -439,12 +477,6 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             return BEST_FATTN_KERNEL_NONE;
     }
 
-#ifndef GGML_CUDA_FA_ALL_QUANTS
-    if (K->type != V->type) {
-        return BEST_FATTN_KERNEL_NONE;
-    }
-#endif // GGML_CUDA_FA_ALL_QUANTS
-
     if (!ggml_cuda_fattn_kv_type_supported(K->type) || !ggml_cuda_fattn_kv_type_supported(V->type)) {
         return BEST_FATTN_KERNEL_NONE;
     }
@@ -455,7 +487,9 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
     // For small batch sizes the vector kernel may be preferable over the kernels optimized for large batch sizes:
     // 192 satisfies % 64 == 0 but has no vec instance (DKQ != DV); force it onto the MMA path.
-    const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 && K->ne[1] % FATTN_KQ_STRIDE == 0;
+    // KV types without a compiled vec instance also go to the tile/MMA path.
+    const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 && K->ne[1] % FATTN_KQ_STRIDE == 0
+        && ggml_cuda_fattn_vec_case_available(K->type, V->type);
 
     // If Turing tensor cores are available, use them:
     if (turing_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
