@@ -511,7 +511,7 @@ Snapshotting at the prompt boundary instead of after the first token, or moving 
 work off the generation thread, would remove this without losing the warm-restart
 capability.
 
-### 4.6 At `-np 1` the RAM prompt cache is dead; the SSD tier does all the work
+### 4.6 The cache is three tiers, two of them RAM; `-np 1` kills the fourth
 
 The server says so itself at startup:
 
@@ -539,6 +539,53 @@ The SSD checkpoint compat hash encodes the KV type (`type_k=8` q8_0 →
 KV types cannot share checkpoints. Give each profile its own `SSD_CACHE_DIR`. The
 on-disk format also changed in `59da9e100` ("kv-ssd: v4 format"), so caches written by
 pre-2026-08-22 builds are stale.
+
+#### Tier layout
+
+`--cache-ssd` is not a disk cache. It is a tiered store with two RAM levels in front
+of the disk, and the deployed profile sizes them explicitly:
+
+| tier | where | budget | window flag |
+|---|---|---|---|
+| hot | host RAM | `--cache-ssd-hot-ram 8192` MiB | `--cache-ssd-hot-window 150000` tok — always keep |
+| warm | host RAM | `--cache-ssd-warm-ram 8192` MiB | `--cache-ssd-warm-window` (default 32768 tok) — keep in RAM |
+| cold | disk | `--cache-ssd-cold-maxsize 356000` MiB | — |
+| (`--cache-ram 8192`) | host RAM | upstream's prompt cache | **no-op at `-np 1`**, see above |
+
+Startup confirms the two RAM budgets, and the per-turn line shows them filling:
+
+```
+srv load_model: SSD cache enabled: path=/cache/kv, hot=8192 MiB, warm=8192 MiB
+SSD cache: turn 96 complete (hot=4434 MiB warm=8428 MiB cold=0 checkpoints=7)
+```
+
+So a hit is served from RAM whenever the conversation is recent; the disk is the
+overflow and the persistence layer. Budget accordingly — the two tiers are 16 GiB of
+the host's 125 GiB, *on top of* the ~21 GiB the cold tier currently holds on disk.
+
+#### Reboot survival
+
+The cold tier survives a restart and a reboot. It is a plain file tree
+(`ckpt-N.bin`, 1–2.5 GiB each) on a persistent filesystem, bind-mounted in:
+
+```
+bind /nvme/llm/cachyllama-cache -> /cache        # zfs, pool "nvme"
+```
+
+Metal-proven across a container restart: `docker compose down && up`, then the same
+prompt → `cache_n = 27223`, `prompt_n = 1` (§4.1). The RAM tiers are of course lost
+and repopulate from the cold tier, so the first hit after a boot is a disk read.
+
+One rig-specific caveat, and it explains an earlier measurement: this pool runs
+**`sync=disabled`**. The server's fsync on checkpoint writes is therefore ignored by
+ZFS — which is why `--cache-ssd-no-fsync` measured as a rounding error (1040 vs
+1076 ms fixed cost, §4.5): the cost is the GPU→host state copy plus the write, never
+the sync. After an *unclean* stop the pool rolls back to the last committed txg
+(≤ `zfs_txg_timeout`, 5 s by default), so the newest checkpoints can be missing.
+That degrades to a miss, not to corruption: the loader validates a header checksum
+(`kv-ssd-cache.cpp:697`), the `model_identity`, the format version, and reads the
+payload with `pread_all()`, so a rolled-back or truncated file fails the read and is
+treated as a clean miss. A clean `reboot` loses nothing.
 
 ### 4.7 Other things worth knowing
 
