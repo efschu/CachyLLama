@@ -550,7 +550,28 @@ of the disk, and the deployed profile sizes them explicitly:
 | hot | host RAM | `--cache-ssd-hot-ram 8192` MiB | `--cache-ssd-hot-window 150000` tok — always keep |
 | warm | host RAM | `--cache-ssd-warm-ram 8192` MiB | `--cache-ssd-warm-window` (default 32768 tok) — keep in RAM |
 | cold | disk | `--cache-ssd-cold-maxsize 356000` MiB | — |
-| (`--cache-ram 8192`) | host RAM | upstream's prompt cache | **no-op at `-np 1`**, see above |
+| (`--cache-ram`) | host RAM | upstream's prompt cache — **set to `0` here** | dead at `-np 1`, see below |
+
+The deployed profiles set `--cache-ram 0`. It reads like a second, competing host-RAM
+cache in front of the fork's own two tiers, but `8192` was only restating the upstream
+default (`common/common.h:632`), and at `-np 1` it is inert either way — the fork's own
+comment says the round-trip is skipped "but the memory is still reserved"
+(`server-context.cpp:1467`), and the server emits `SRV_WRN: --cache-ram is a no-op with
+a single slot`. Measured container RSS at startup, before any request:
+
+| `--cache-ram` | RSS after load | reuse on an A → B → A switch |
+|---|---|---|
+| 8192 | 2.437 GiB | `cache_n = 9036` (§4.6 table above) |
+| 0 | 2.439 GiB | `cache_n = 5227`, `prompt_n = 1`, server-side `total time = 2233 ms` |
+
+So "reserved" means the budget, not an allocation: it costs zero bytes. Setting it to
+`0` buys no memory — it removes the warning and one dead code path. The single side
+effect is that `--cache-idle-slots` turns itself off (`--cache-idle-slots requires
+--cache-ram, disabling`), which is free here: that feature publishes idle slots through
+the same save path that `-np 1` already skips.
+
+Do not set it to `0` on a `--parallel > 1` deployment — there the round-trip is real and
+it is the only cross-*task* prompt reuse upstream has.
 
 Startup confirms the two RAM budgets, and the per-turn line shows them filling:
 
