@@ -4455,7 +4455,28 @@ private:
                                     SLT_WRN(slot, "%s\n", st1.str().c_str());
                                 }
 
-                                if (pos_min <= pos_min_thold) {
+                                // pos_min is the lowest position the memory module still holds
+                                // for this sequence; pos_min_thold is the largest pos_min a
+                                // checkpoint may have and still be useful. The recovery below is
+                                // needed exactly when the memory no longer covers the positions
+                                // the LCP wants, i.e. when pos_min has risen TO OR ABOVE the
+                                // threshold - not when it is still below it.
+                                //
+                                // 6af265fa1 inverted this gate while aiming at the
+                                // `cur.pos_min < pos_min_thold` predicate inside the find_if
+                                // below (which is unchanged and matches upstream). The
+                                // inversion skips the checkpoint restore and the do_reset
+                                // fallback in the one case they exist for, so execution reaches
+                                // slot.mem.seq_rm(slot.id, p0, -1) with a rollback the recurrent
+                                // cache cannot perform. On a hybrid GDN model that is fatal:
+                                // before b83d23022 llama_memory_recurrent::seq_rm returned false
+                                // and common_context_seq_rm aborted the server; since
+                                // b83d23022 it falls through to the cell-clearing loop, which
+                                // sets tail_id = -1 and drops the sequence's recurrent state
+                                // while the attention cache keeps the prefix. The linear-attention
+                                // layers then run from a zero state over a long context and the
+                                // model produces fluent, repeating nonsense.
+                                if (pos_min >= pos_min_thold) {
                                     // search for a context checkpoint
                                     const auto it = std::find_if(
                                         slot.prompt.checkpoints.rbegin(),
