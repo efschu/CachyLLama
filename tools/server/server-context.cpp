@@ -5606,16 +5606,24 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             task.id_slot = json_value(data, "id_slot", -1);
             sse_ping_interval = task.params.sse_ping_interval;
 
-            // Operator-supplied user identity. The HTTP layer may also
-            // synthesize a tenant/user label via metadata->user_id; the
-            // raw field is the canonical CachyLLama form. Empty value is
-            // valid (anonymous bucket, no per-user cap).
-            try {
+            // User identity, used for prompt/KV cache bucketing, slot affinity
+            // and the per-user concurrency cap.
+            //
+            // This is deliberately gated on --user-isolation. The value arrives
+            // from the *client* (llama_user_id, or metadata.user_id on the
+            // Anthropic endpoint), so without a server-side switch any client
+            // can partition the server's prompt cache without the operator
+            // asking for it: a distinct id routes to its own bucket
+            // (<cache>/u/<hash>) and blocks reuse of a slot owned by another
+            // id. A client that rotates the id per session or per request then
+            // gets zero cross-request reuse - the single-tenant default has to
+            // be "one shared bucket", not "whatever the client says".
+            //
+            // With the flag off the field is ignored entirely, which is also
+            // what makes the prompt cache work across requests unconditionally.
+            if (params.user_isolation) {
                 task.user_id = server_task::validate_user_id(
                     json_value(data, "llama_user_id", std::string()));
-            } catch (const std::invalid_argument & e) {
-                throw std::invalid_argument(
-                    std::string("invalid llama_user_id: ") + e.what());
             }
 
             // OAI-compat

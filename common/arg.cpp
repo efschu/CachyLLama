@@ -2682,6 +2682,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MAX_CONCURRENT_PER_USER").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--user-isolation"},
+        string_format("honour the request-supplied llama_user_id: give each user their own prompt/KV cache bucket, "
+                      "slot affinity and concurrency cap (default: %s). when disabled the field is ignored and every "
+                      "request shares the _anonymous bucket, so the prompt cache is reused across requests regardless "
+                      "of what the client sends.", params.user_isolation ? "enabled" : "disabled"),
+        [](common_params & params) {
+            params.user_isolation = true;
+        }
+    ).set_env("LLAMA_ARG_USER_ISOLATION").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-ns", "--sequences"}, "N",
         string_format("number of sequences to decode (default: %d)", params.n_sequences),
         [](common_params & params, int value) {
