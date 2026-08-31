@@ -1,0 +1,272 @@
+From f16ccb69b401a4a2af2de42ac3faaa02037ec2c7 Mon Sep 17 00:00:00 2001
+From: efschu <efschu@users.noreply.github.com>
+Date: Mon, 31 Aug 2026 10:15:55 +0000
+Subject: [PATCH] cuda: run FlashAttention on KV types that have no vec kernel
+ instance
+
+ggml_cuda_fattn_kv_type_supported() gated every FlashAttention kernel on the
+availability of a *vector* kernel instance for the KV cache type. In a default
+build (GGML_CUDA_FA_ALL_QUANTS=OFF) only the f16/bf16/q4_0/q8_0 instances are
+compiled, so q4_1, q5_0, q5_1 and iq4_nl were reported as unsupported and the
+FLASH_ATTN_EXT node was scheduled onto the CPU backend.
+
+The tile and MMA_F16 kernels never read the KV cache type directly: launch_fattn()
+dequantizes K and V to F16 up front (need_f16_K / need_f16_V), which is already
+how q8_0 and q4_0 are served on pre-Turing hardware. Only the vec kernels are
+per-type templates.
+
+So split the predicate in two:
+
+  - ggml_cuda_fattn_vec_case_available() reports whether a vec instance exists for
+    the (type_K, type_V) pair. It also absorbs the same-type restriction that was
+    previously applied to all kernels, and gates can_use_vector_kernel.
+  - ggml_cuda_fattn_kv_type_supported() now accepts any type with a
+    non-contiguous dequantization kernel, i.e. anything tile/MMA can convert.
+
+Consequences:
+
+  - q4_1/q5_0/q5_1/iq4_nl KV no longer fall back to the CPU in any split mode.
+  - --split-mode tensor works with them. There the CPU fallback was not merely
+    slow but fatal: the meta backend cannot infer a split state for a node it
+    does not own and aborts with
+    GGML_ASSERT(ret.axis != GGML_BACKEND_SPLIT_AXIS_UNKNOWN) in
+    ggml-backend-meta.cpp. Refs #27116, #23567, #21788.
+  - type_K != type_V is now allowed, served by the tile/MMA path.
+  - No change in kernel selection for f16/bf16/q4_0/q8_0, and no additional
+    template instances are compiled, so build time is unaffected.
+
+iq4_nl needed two small pieces to become usable as a KV cache type at all:
+a non-contiguous dequantization kernel for the FlashAttention conversion, and
+the iq4_nl -> f32 copy direction used by the quantized K-shift path
+(build_rope_shift dequantizes, rotates and requantizes). iq4_nl uses the q4_0
+nibble layout with the kvalues_iq4nl table, so dequantize_iq4_nl() plugs
+straight into the existing dequantize_block_cuda / cpy_blck_q_f32 templates.
+
+docs/multi-gpu.md still claimed that quantized KV cache is unsupported with
+--split-mode tensor and documented an error string that no longer exists in the
+code; both are corrected.
+
+Tested on 2x Tesla V100-SXM2-16GB (sm_70, CUDA 12.8.1, --split-mode tensor
+-ts 1,1 -fa on, Qwen3.8-27B-Q6_K): f16, q8_0, q4_0, q4_1, q5_0, q5_1 and iq4_nl
+all load and generate correct output. Before the change q4_1, q5_0, q5_1 and
+iq4_nl aborted at startup in ggml-backend-meta.cpp.
+---
+ docs/multi-gpu.md                 |  4 +-
+ ggml/src/ggml-cuda/convert.cu     |  2 +
+ ggml/src/ggml-cuda/cpy.cu         | 17 +++++++++
+ ggml/src/ggml-cuda/dequantize.cuh | 13 +++++++
+ ggml/src/ggml-cuda/fattn.cu       | 62 ++++++++++++++++++++++++-------
+ ggml/src/ggml-cuda/ggml-cuda.cu   |  3 ++
+ 6 files changed, 85 insertions(+), 16 deletions(-)
+
+diff --git a/docs/multi-gpu.md b/docs/multi-gpu.md
+index 0d9eea7..233c9d9 100644
+--- a/docs/multi-gpu.md
++++ b/docs/multi-gpu.md
+@@ -84,7 +84,7 @@ llama-cli -m model.gguf -sm tensor -ctk f16 -ctv f16
+ ```
+ 
+ - `--flash-attn off` or (`--flash-attn auto` resolving to `off` when it isn't supported) is a hard error.
+-- KV cache types must be non-quantized: `f32`, `f16`, or `bf16`. Support for quantized KV cache is not implemented and trying to use it will result in an error.
++- KV cache quantization works for every type the CUDA FlashAttention kernels can consume: `f32`, `f16`, `bf16`, `q8_0`, `q4_0`, `q4_1`, `q5_0`, `q5_1`, `iq4_nl`. Types without a compiled FlashAttention *vector* kernel instance (`q4_1`, `q5_0`, `q5_1`, `iq4_nl` in a default build) are served by the tile/MMA kernels, which dequantize K/V to F16 on the fly: correct and fully GPU-resident, but slower than a native instance. Build with `-DGGML_CUDA_FA_ALL_QUANTS=ON` to get native vector kernels for all of them.
+ - Mark this configuration as experimental in your tooling: validate output quality before deploying.
+ - `--split-mode tensor`is not implemented for all architectures. The following will fail with *"LLAMA_SPLIT_MODE_TENSOR not implemented for architecture '...'"*:
+ 
+@@ -118,7 +118,7 @@ P2P requires driver support (usually restricted to workstation/datacenter GPUs)
+ | Symptom | How to fix |
+ |---|---|
+ | Startup error *"SPLIT_MODE_TENSOR requires flash_attn to be enabled"* | Add `-fa on` or remove `-fa off`. |
+-| Startup error *"simultaneous use of SPLIT_MODE_TENSOR and KV cache quantization not implemented"* | Use `-ctk f16 -ctv f16` (or `bf16`/`f32`) with `--split-mode tensor`. |
++| Startup abort *"GGML_ASSERT(ret.axis != GGML_BACKEND_SPLIT_AXIS_UNKNOWN) failed"* in `ggml-backend-meta.cpp` | A graph node could not be placed on the split devices. This happens when the backend reports an op/type combination as unsupported: with the other split modes the scheduler silently offloads such a node to the CPU, but under `tensor` there is no valid split state for it. Check `--cache-type-k`/`--cache-type-v` first, then report the log upstream. |
+ | Startup error *"LLAMA_SPLIT_MODE_TENSOR not implemented for architecture 'X'"* | Architecture not on the TENSOR allow-list. Use `--split-mode layer`. |
+ | Warning *"NCCL is unavailable, multi GPU performance will be suboptimal"* | llama.cpp wasn't built with NCCL. Either accept the lower performance or install NCCL and rebuild. |
+ | CUDA OOM at startup or during prefill in `--split-mode tensor` | Auto-fit is disabled in this mode, so reduce memory pressure yourself. In order from least to most disruptive: lower `--ctx-size` (`-c`) (KV cache is roughly proportional to `n_ctx`); for `llama-server`, lower `--parallel` (`-np`) (a slot KV cache is allocated per concurrent sequence); as a last resort, reduce `--n-gpu-layers` (`-ngl`) (the remaining layers run on CPU and inference will be much slower). |
+diff --git a/ggml/src/ggml-cuda/convert.cu b/ggml/src/ggml-cuda/convert.cu
+index 360c614..946ce0b 100644
+--- a/ggml/src/ggml-cuda/convert.cu
++++ b/ggml/src/ggml-cuda/convert.cu
+@@ -647,6 +647,8 @@ to_fp16_nc_cuda_t ggml_get_to_fp16_nc_cuda(ggml_type type) {
+             return dequantize_block_cuda<QK5_1, QR5_1, dequantize_q5_1>;
+         case GGML_TYPE_Q8_0:
+             return dequantize_block_cuda<QK8_0, QR8_0, dequantize_q8_0>;
++        case GGML_TYPE_IQ4_NL:
++            return dequantize_block_cuda<QK4_NL, QR4_NL, dequantize_iq4_nl>;
+         case GGML_TYPE_BF16:
+             return convert_unary_cuda<nv_bfloat16>;
+         default:
+diff --git a/ggml/src/ggml-cuda/cpy.cu b/ggml/src/ggml-cuda/cpy.cu
+index fd7ffc0..4bee63e 100644
+--- a/ggml/src/ggml-cuda/cpy.cu
++++ b/ggml/src/ggml-cuda/cpy.cu
+@@ -386,6 +386,20 @@ static void ggml_cpy_f32_iq4_nl_cuda(
+         (cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13);
+ }
+ 
++static void ggml_cpy_iq4_nl_f32_cuda(
++    const char * cx, char * cdst, const int64_t ne,
++    const int64_t ne00, const int64_t ne01, const int64_t ne02,
++    const int64_t nb00, const int64_t nb01, const int64_t nb02,
++    const int64_t nb03, const int64_t ne10, const int64_t ne11, const int64_t ne12,
++    const int64_t nb10, const int64_t nb11, const int64_t nb12, const int64_t nb13,
++    cudaStream_t stream) {
++    const int64_t num_blocks = (ne/QK4_NL + CUDA_CPY_BLOCK_SIZE - 1) / CUDA_CPY_BLOCK_SIZE;
++    GGML_ASSERT(num_blocks <= INT_MAX);
++    cpy_q_f32<cpy_blck_q_f32<dequantize_iq4_nl, QK4_NL>, QK4_NL><<<num_blocks, CUDA_CPY_BLOCK_SIZE, 0, stream>>>(
++        cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03,
++        ne10, ne11, ne12, nb10, nb11, nb12, nb13);
++}
++
+ // check if a same-type copy reduces to a 2D strided copy (height rows of width
+ // contiguous bytes), so it can use cudaMemcpy2DAsync instead of the scalar kernel
+ static bool ggml_cuda_cpy_as_memcpy_2d(const ggml_tensor * src0, const ggml_tensor * src1,
+@@ -527,6 +541,9 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
+     } else if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_IQ4_NL) {
+         ggml_cpy_f32_iq4_nl_cuda
+                 (src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
++    } else if (src0->type == GGML_TYPE_IQ4_NL && src1->type == GGML_TYPE_F32) {
++        ggml_cpy_iq4_nl_f32_cuda
++                (src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
+     } else if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_Q5_1) {
+         ggml_cpy_f32_q5_1_cuda
+                 (src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
+diff --git a/ggml/src/ggml-cuda/dequantize.cuh b/ggml/src/ggml-cuda/dequantize.cuh
+index 651524b..267203e 100644
+--- a/ggml/src/ggml-cuda/dequantize.cuh
++++ b/ggml/src/ggml-cuda/dequantize.cuh
+@@ -119,6 +119,19 @@ static __device__ __forceinline__ void dequantize_q8_0(const void * vx, const in
+     v.y *= d;
+ }
+ 
++// iq4_nl uses the same nibble layout as q4_0 (low nibbles first, high nibbles
++// offset by QK4_NL/2), but the codes index a non-linear value table.
++static __device__ __forceinline__ void dequantize_iq4_nl(const void * vx, const int64_t ib, const int iqs, float2 & v){
++    const block_iq4_nl * x = (const block_iq4_nl *) vx;
++
++    const float d = x[ib].d;
++
++    const int vui = x[ib].qs[iqs];
++
++    v.x = d * kvalues_iq4nl[vui & 0xF];
++    v.y = d * kvalues_iq4nl[vui >>  4];
++}
++
+ //================================== k-quants
+ 
+ // Each call dequantizes one super-block of QK_K values into y using the
+diff --git a/ggml/src/ggml-cuda/fattn.cu b/ggml/src/ggml-cuda/fattn.cu
+index ab7a3b2..dabce18 100644
+--- a/ggml/src/ggml-cuda/fattn.cu
++++ b/ggml/src/ggml-cuda/fattn.cu
+@@ -335,26 +335,64 @@ enum best_fattn_kernel {
+     BEST_FATTN_KERNEL_MMA_F16 = 400,
+ };
+ 
+-static bool ggml_cuda_fattn_kv_type_supported(ggml_type type) {
++// The FlashAttention vector kernels are templated on (type_K, type_V) and only a
++// subset of the instances is compiled unless GGML_CUDA_FA_ALL_QUANTS is set.
++static bool ggml_cuda_fattn_vec_type_available(ggml_type type) {
+     switch (type) {
+-        case GGML_TYPE_F32:
++        case GGML_TYPE_F32: // routed to the F16 instance by FATTN_VEC_CASE
+         case GGML_TYPE_F16:
++        case GGML_TYPE_BF16:
++        case GGML_TYPE_Q4_0:
++        case GGML_TYPE_Q8_0:
+             return true;
+         case GGML_TYPE_Q4_1:
+         case GGML_TYPE_Q5_0:
+         case GGML_TYPE_Q5_1:
+-#ifndef GGML_CUDA_FA_ALL_QUANTS
++#ifdef GGML_CUDA_FA_ALL_QUANTS
++            return true;
++#else
+             return false;
+ #endif // GGML_CUDA_FA_ALL_QUANTS
+-        case GGML_TYPE_Q4_0:
+-        case GGML_TYPE_Q8_0:
+-        case GGML_TYPE_BF16:
+-            return true;
+         default:
+             return false;
+     }
+ }
+ 
++static bool ggml_cuda_fattn_vec_case_available(ggml_type type_K, ggml_type type_V) {
++    if (!ggml_cuda_fattn_vec_type_available(type_K) || !ggml_cuda_fattn_vec_type_available(type_V)) {
++        return false;
++    }
++
++#ifndef GGML_CUDA_FA_ALL_QUANTS
++    // only the same-type instances are compiled, F32 is read through the F16 instance
++    const ggml_type tk = type_K == GGML_TYPE_F32 ? GGML_TYPE_F16 : type_K;
++    const ggml_type tv = type_V == GGML_TYPE_F32 ? GGML_TYPE_F16 : type_V;
++
++    if (tk != tv) {
++        return false;
++    }
++#endif // GGML_CUDA_FA_ALL_QUANTS
++
++    return true;
++}
++
++// The tile and MMA kernels dequantize K and V to F16 up front (need_f16_K /
++// need_f16_V in launch_fattn), so a KV type without a vector kernel instance is
++// still usable as long as it has a dequantization kernel. Reporting it as
++// unsupported instead pushes the node onto the CPU backend, which is not only
++// orders of magnitude slower but outright impossible with LLAMA_SPLIT_MODE_TENSOR,
++// where the meta backend cannot infer a split axis for a node it does not own and
++// aborts in ggml_backend_meta_split_state().
++static bool ggml_cuda_fattn_kv_type_supported(ggml_type type) {
++    switch (type) {
++        case GGML_TYPE_F32:
++        case GGML_TYPE_F16:
++            return true;
++        default:
++            return ggml_get_to_fp16_nc_cuda(type) != nullptr;
++    }
++}
++
+ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
+ #ifndef FLASH_ATTN_AVAILABLE
+     GGML_UNUSED(device); GGML_UNUSED(dst);
+@@ -439,12 +477,6 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
+             return BEST_FATTN_KERNEL_NONE;
+     }
+ 
+-#ifndef GGML_CUDA_FA_ALL_QUANTS
+-    if (K->type != V->type) {
+-        return BEST_FATTN_KERNEL_NONE;
+-    }
+-#endif // GGML_CUDA_FA_ALL_QUANTS
+-
+     if (!ggml_cuda_fattn_kv_type_supported(K->type) || !ggml_cuda_fattn_kv_type_supported(V->type)) {
+         return BEST_FATTN_KERNEL_NONE;
+     }
+@@ -455,7 +487,9 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
+ 
+     // For small batch sizes the vector kernel may be preferable over the kernels optimized for large batch sizes:
+     // 192 satisfies % 64 == 0 but has no vec instance (DKQ != DV); force it onto the MMA path.
+-    const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 && K->ne[1] % FATTN_KQ_STRIDE == 0;
++    // KV types without a compiled vec instance also go to the tile/MMA path.
++    const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 && K->ne[1] % FATTN_KQ_STRIDE == 0
++        && ggml_cuda_fattn_vec_case_available(K->type, V->type);
+ 
+     // If Turing tensor cores are available, use them:
+     if (turing_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index a6fc655..7740c4b 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -5098,6 +5098,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+                 if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_IQ4_NL) {
+                     return true;
+                 }
++                if (src0_type == GGML_TYPE_IQ4_NL && src1_type == GGML_TYPE_F32) {
++                    return true;
++                }
+                 if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_I32) {
+                     return true;
+                 }
+-- 
+2.43.0
+

@@ -1,0 +1,88 @@
+# CachyLLama, long-context profile: q5_1 K/V + -ub 512 + 205k context.
+#
+# Trades cold-prefill throughput for context length. All values measured on
+# 2x V100-SXM2-16GB, 9040-token prompt, cache_prompt=false (see handoff-REPORT.md 6.4):
+#
+#   profile                          VRAM        prefill      decode @n=192   context
+#   q8_0 / ub 1024  (production)     31454 MiB   1035 tok/s   62.1 tok/s      150 000
+#   q5_1 / ub  512  (this file)      31434 MiB    863 tok/s   57.4 tok/s      205 000
+#
+# So: +37% context for -17% cold prefill and -8% decode, at the same VRAM headroom.
+# The prefill loss is largely irrelevant when the SSD prompt cache hits (report 6.2).
+# The decode delta at n=192 was not root-caused; per-token cost is context-dependent.
+# Published quality data (V100_NOTES.md 4.3) says the better trade is ASYMMETRIC:
+#   KV_TYPE_K=q8_0 CTX_SIZE=164000 docker compose -f <this file> up -d
+# K=q8_0/V=q5_1 costs only 29-49% of symmetric q5_1's KL penalty for 21% more KV,
+# and K at q8_0 measures as essentially free on this model family. Symmetric q5_1
+# costs ~4.6 points of AIME25 vs q8_0 upstream - use it only if you need the 205k.
+#
+# REQUIRES the patched image: q5_1 with --split-mode tensor aborts on a stock build
+# (GGML_ASSERT(ret.axis != GGML_BACKEND_SPLIT_AXIS_UNKNOWN), see report 8.1-8.2).
+#
+# Own SSD cache dir: the checkpoint compat hash includes the KV type
+# (q8_0 -> a6e64a7b2a475306, q5_1 -> 33e4eb71fcdb22b6), so the two profiles would not
+# share checkpoints anyway.
+#
+# Same project + service key as dual-mtp-3.8.yml and dual-mtp-3.8_cachyllama.yml, so
+# `docker compose -f <file> up -d` switches between the three profiles in one command.
+services:
+  llama-cpp-qwen36-27b-dual-mtp-vision:
+    image: cachyllama:server-cuda-4ec44dc-sm70-v100
+    container_name: "${ESTATE_CONTAINER:-llama-cpp-qwen36-27b-cachyllama-q5_1}"
+    shm_size: 16384mb
+    restart: no
+    security_opt:
+      - apparmor=unconfined
+    ports:
+      - "${ESTATE_PORT:-${PORT:-8064}}:8080"
+    volumes:
+      - "${MODEL_DIR:-/nvme/llm/club-3090/models-cache}:/models:ro"
+      - "${SSD_CACHE_DIR:-/nvme/llm/cachyllama-cache-q5_1}:/cache"
+    command: >-
+      --host 0.0.0.0
+      --port 8080
+      -m /models/huihui-ai/Huihui-Qwen3.8-27B-abliterated-GGUF/Huihui-Qwen3.8-27B-abliterated-Q6_K.gguf
+      --mmproj /models/huihui-ai/Huihui-Qwen3.8-27B-abliterated-GGUF/mmproj-F16.gguf
+      --no-mmproj-offload
+      --image-min-tokens ${IMAGE_MIN_TOKENS:-1024}
+      --image-max-tokens ${IMAGE_MAX_TOKENS:-1024}
+      -c ${CTX_SIZE:-205000}
+      -b ${BATCH_SIZE:-1024}
+      -ub ${UBATCH_SIZE:-512}
+      -ngl all
+      -fa on
+      --cache-type-k ${KV_TYPE_K:-q5_1}
+      --cache-type-v ${KV_TYPE_V:-q5_1}
+      --cache-type-k-draft ${KV_TYPE_K:-q5_1}
+      --cache-type-v-draft ${KV_TYPE_V:-q5_1}
+      -np ${NP:-1}
+      --spec-type draft-mtp
+      --spec-draft-n-max ${MTP_DRAFT_N_MAX:-3}
+      --chat-template-file /models/huihui-ai/Huihui-Qwen3.8-27B-abliterated-GGUF/chat_template.jinja
+      --reasoning ${REASONING:-off}
+      --reasoning-format ${REASONING_FORMAT:-deepseek}
+      --chat-template-kwargs '{"enable_thinking": true,"preserve_thinking": true}'
+      --temp ${TEMP:-${TEMPERATURE:-0.6}}
+      --top-p ${TOP_P:-0.95}
+      --top-k ${TOP_K:-20}
+      --min-p ${MIN_P:-0.0}
+      --repeat-penalty ${REPEAT_PENALTY:-1.0}
+      -sm tensor
+      -ts 1,1
+      -fit off
+      --cache-ram 8192
+      --cache-ssd /cache/kv
+      --cache-ssd-cold-maxsize 356000
+      --cache-ssd-hot-ram 8192
+      --cache-ssd-warm-ram 8192
+      --cache-ssd-hot-window ${CTX_SIZE:-205000}
+      --cache-ssd-max-conversations 50
+      --cache-ssd-checkpoints 72
+      --cache-ssd-system-prompts 32
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

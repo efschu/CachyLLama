@@ -1,0 +1,61 @@
+services:
+  llama-cpp-qwen36-27b-dual-mtp-vision:
+    image: cachyllama:server-cuda-4ec44dc-sm70-v100
+    container_name: "${ESTATE_CONTAINER:-llama-cpp-qwen36-27b-cachyllama}"
+    shm_size: 16384mb
+    restart: no
+    security_opt:
+      - apparmor=unconfined
+    ports:
+      - "${ESTATE_PORT:-${PORT:-8064}}:8080"
+    volumes:
+      - "${MODEL_DIR:-/nvme/llm/club-3090/models-cache}:/models:ro"
+      - "${SSD_CACHE_DIR:-/nvme/llm/cachyllama-cache}:/cache"
+    command: >-
+      --host 0.0.0.0
+      --port 8080
+      -m /models/huihui-ai/Huihui-Qwen3.8-27B-abliterated-GGUF/Huihui-Qwen3.8-27B-abliterated-Q6_K.gguf
+      --mmproj /models/huihui-ai/Huihui-Qwen3.8-27B-abliterated-GGUF/mmproj-F16.gguf
+      --no-mmproj-offload
+      --image-min-tokens ${IMAGE_MIN_TOKENS:-1024}
+      --image-max-tokens ${IMAGE_MAX_TOKENS:-1024}
+      -c 150000
+      -b ${BATCH_SIZE:-1024}
+      -ub ${UBATCH_SIZE:-1024}
+      -ngl all
+      -fa on
+      --cache-type-k ${KV_TYPE:-q8_0}
+      --cache-type-v ${KV_TYPE:-q8_0}
+      --cache-type-k-draft q8_0
+      --cache-type-v-draft q8_0
+      -np ${NP:-1}
+      --spec-type draft-mtp
+      --spec-draft-n-max ${MTP_DRAFT_N_MAX:-3}
+      --chat-template-file /models/huihui-ai/Huihui-Qwen3.8-27B-abliterated-GGUF/chat_template.jinja
+      --reasoning ${REASONING:-off}
+      --reasoning-format ${REASONING_FORMAT:-deepseek}
+      --chat-template-kwargs '{"enable_thinking": true,"preserve_thinking": true}'
+      --temp ${TEMP:-${TEMPERATURE:-0.6}}
+      --top-p ${TOP_P:-0.95}
+      --top-k ${TOP_K:-20}
+      --min-p ${MIN_P:-0.0}
+      --repeat-penalty ${REPEAT_PENALTY:-1.0}
+      -sm tensor
+      -ts 1,1
+      -fit off
+      --cache-ram 8192
+      --cache-ssd /cache/kv
+      --cache-ssd-cold-maxsize 356000
+      --cache-ssd-hot-ram 8192
+      --cache-ssd-warm-ram 8192
+      --cache-ssd-hot-window 150000
+      --cache-ssd-max-conversations 50
+      --cache-ssd-checkpoints 72
+      --cache-ssd-system-prompts 32
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
