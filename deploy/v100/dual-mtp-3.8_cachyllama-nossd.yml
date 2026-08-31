@@ -1,7 +1,7 @@
 services:
   llama-cpp-qwen36-27b-dual-mtp-vision:
     image: cachyllama:server-cuda-5256204-sm70-v100
-    container_name: "${ESTATE_CONTAINER:-llama-cpp-qwen36-27b-cachyllama}"
+    container_name: "${ESTATE_CONTAINER:-llama-cpp-qwen36-27b-cachyllama-nossd}"
     shm_size: 16384mb
     restart: no
     security_opt:
@@ -10,7 +10,6 @@ services:
       - "${ESTATE_PORT:-${PORT:-8064}}:8080"
     volumes:
       - "${MODEL_DIR:-../../../../../../models-cache}:/models:ro"
-      - "${SSD_CACHE_DIR:-/nvme/llm/cachyllama-cache}:/cache"
     command: >-
       --host 0.0.0.0
       --port 8080
@@ -43,15 +42,6 @@ services:
       -sm tensor
       -ts 1,1
       -fit off
-      --cache-ram 8192
-      --cache-ssd /cache/kv
-      --cache-ssd-cold-maxsize 356000
-      --cache-ssd-hot-ram 8192
-      --cache-ssd-warm-ram 8192
-      --cache-ssd-hot-window 150000
-      --cache-ssd-max-conversations 50
-      --cache-ssd-checkpoints 72
-      --cache-ssd-system-prompts 32
     deploy:
       resources:
         reservations:

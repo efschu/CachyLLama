@@ -80,7 +80,7 @@ but `-fa on` is set explicitly in all profiles here.
 
 ## 3. Run
 
-Three compose profiles in `deploy/v100/`. They all declare the **same project +
+Four compose profiles in `deploy/v100/`. They all declare the **same project +
 service key**, so `up -d` on any one of them replaces whichever is running — that is
 the switch and the rollback, one command each:
 
@@ -89,6 +89,7 @@ cd deploy/v100
 docker compose -f dual-mtp-3.8_original-llamacpp.yml       up -d   # upstream llama.cpp, reference
 docker compose -f dual-mtp-3.8_cachyllama.yml              up -d   # production: q8_0 KV, -ub 1024, 150k
 docker compose -f dual-mtp-3.8_cachyllama-q5_1-longctx.yml up -d   # q5_1 KV, -ub 512, 205k  (needs the patch)
+docker compose -f dual-mtp-3.8_cachyllama-nossd.yml        up -d   # diagnostic: args byte-identical to upstream
 ```
 
 Override with env: `MODEL_DIR`, `SSD_CACHE_DIR`, `CTX_SIZE`, `UBATCH_SIZE`,
@@ -117,7 +118,7 @@ The compose files use `deploy.resources.reservations.devices`, which works.
 
 ## 4. Findings
 
-### 4.1 The hybrid `seq_rm` abort — and the loops that replaced it
+### 4.1 The hybrid warm-slot / cache path: an abort, an inverted gate, and the loops
 
 A build from `b9ed083e4` (2026-08-21) died on the **second** request of any
 conversation:
@@ -199,11 +200,61 @@ ring covers the LCP, so there is **no** full re-prefill.
 * Do not run a CachyLLama build between `6af265fa1` and this fix on a hybrid
   (Gated-DeltaNet / Mamba) model. Before `b83d23022` it crashes; after, it degrades
   silently.
-* This is not fully proven to be the *only* cause of the loops reported in
-  production: the harness reproduces state corruption and the fix removes it, but the
-  probe questions produce short answers, so corruption shows up as wrong facts rather
-  than runaway repetition. If loops recur on `974af40b3`, capture `-lv 4` and look for
-  `pos_min`, `do_reset` and `memory_seq_rm` lines.
+* The loops **did** recur on `974af40b3`, so the inverted gate was not their cause.
+  The path that is follows below. The two are independent: the gate corrupts while
+  truncating a *warm* slot, the SSD restore corrupts on *cold start*.
+
+#### What actually caused the loops: a recurrent state restored at the wrong length
+
+`105889b46` made the cold-start SSD restore accept **partial** LCP matches ("fix cache
+hit collapse after agent trims"). The hybrid gate below it had three cases, and case 3
+was "partial coverage → cap `n_past` to the LCP". That cap cannot work:
+
+* a recurrent state is one fixed-size tensor, folded over exactly the tokens the
+  checkpoint was captured over. It is valid at that one length and nowhere else, and
+  there is no representation of "the same state, N tokens earlier";
+* `llama_memory_seq_rm_attn_only()` deliberately *preserves* the recurrent R/S data
+  (its own comment says so) and clears only attention cells and stale positions.
+
+So after the cap the 49 Gated-DeltaNet layers still carry the state of the **whole**
+stored sequence — including the previous turn's generated output — while the server
+believes only `ssd_lcp` tokens are cached and prefills the rest. Generation continues
+from a state that encodes the text the model just produced, which pulls it back onto
+those exact tokens; `--repeat-penalty 1.0` brakes nothing. An agent that trims or
+rewrites history produces precisely the partial match this triggers on, every turn.
+
+Measured, both builds, same test — fresh prompt, restart, identical prompt, restart,
+then a prompt with a chunk removed after the first ~11k tokens
+(`lcp_ratio = ssd_lcp / min(n_tokens, 4096)`, so the ratio is 100 % and the old build
+is forced into its cap branch rather than its reject branch):
+
+| run 3 — trimmed prompt, cold start | `974af40b3` | `525620403` |
+|---|---|---|
+| decision | `partial-coverage: lcp=4096 ssd_n_tokens=27224` **`cap to LCP`** | **`rejecting`**` … partial coverage cannot be truncated` |
+| tokens the restored state was captured over | 27 224 | — |
+| tokens the server then believed cached (`n_push`) | **4 096** | — |
+| `cache_n` / `prompt_n` | 4 096 / 19 724 | 0 / 23 820 |
+| run 2 — identical prompt, cold start | `cache_n = 27 223`, `prompt_n = 1` | `cache_n = 27 223`, `prompt_n = 1` |
+
+Fix on this branch: for recurrent/hybrid contexts accept **full coverage or nothing**.
+Run 2 shows the headline feature — full state reuse across a container restart — is
+untouched; only the unsound path is gone. The cost is bounded: in the trimmed case
+4 096 tokens of prefill that were previously "reused" wrongly, and in the ordinary
+agentic case, where history only grows, coverage is full and nothing changes.
+
+The same construction sat in the system-prompt cache. `load_prefix()` matches a stored
+entry on its first 64 tokens only; the code then set `n_past` to *this* task's
+boundary, arguing the "state drift is bounded by the small divergent region at the
+boundary" — not a property a recurrent state has. Disabled for hybrid contexts, left
+for dense ones where the same construction is also wrong but degrades instead of
+wedging.
+
+**Not proven:** the loop itself was never reproduced synthetically — six deliberate
+attempts stayed clean, because a hand-written harness appends cleanly and never
+produces a partial match. What is proven is that this path fires on exactly the input
+an agent loop produces, and what it hands the model when it does. Upstream has no SSD
+cache tier at all, which is consistent with two weeks of the same client on `b10236`
+without a single occurrence.
 
 ### 4.2 FlashAttention + quantized KV under `--split-mode tensor`
 

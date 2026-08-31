@@ -27,7 +27,7 @@
 # `docker compose -f <file> up -d` switches between the three profiles in one command.
 services:
   llama-cpp-qwen36-27b-dual-mtp-vision:
-    image: cachyllama:server-cuda-974af40-sm70-v100
+    image: cachyllama:server-cuda-5256204-sm70-v100
     container_name: "${ESTATE_CONTAINER:-llama-cpp-qwen36-27b-cachyllama-q5_1}"
     shm_size: 16384mb
     restart: no
@@ -36,7 +36,7 @@ services:
     ports:
       - "${ESTATE_PORT:-${PORT:-8064}}:8080"
     volumes:
-      - "${MODEL_DIR:-/nvme/llm/club-3090/models-cache}:/models:ro"
+      - "${MODEL_DIR:-../../../../../../models-cache}:/models:ro"
       - "${SSD_CACHE_DIR:-/nvme/llm/cachyllama-cache-q5_1}:/cache"
     command: >-
       --host 0.0.0.0
