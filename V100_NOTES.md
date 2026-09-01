@@ -764,6 +764,60 @@ With one slot (`-np 1`) requests queue. Do not benchmark against a live endpoint
 5k-token probe of mine showed 61 s wall while the server reported `total time = 2233 ms`
 for the same task — the difference was queue wait behind the agent's own traffic.
 
+### 4.11 Why the tail exists: `conv_hash` is the first 1024 tokens, and that is the tool list
+
+Captured with `--log-prompts-dir` (a fork flag that dumps the rendered prompt of every
+request; **it writes credentials in plaintext — do not leave it on**) and diffed
+pairwise by longest common prefix. Seven consecutive real requests:
+
+| prompt | chars | LCP with the best earlier one |
+|---|---|---|
+| #1 | 110 636 | — |
+| #2 | 110 025 | 109 157 (99.2 %) |
+| #3 | 149 771 | **41 150 (27.5 %)** |
+| #4 | 149 159 | 148 862 (99.8 %) |
+| #5 | 366 060 | **3 149 (0.9 %)** |
+| #6 | 112 212 | 110 025 (98.1 %, back to #2's conversation) |
+| #7 | 112 894 | 111 916 (99.1 %) |
+
+Neither collapse is auto-compaction or a rewritten history. Read the divergence:
+
+* **#3 vs #2, at char 41 150** — identical system prompt, tools, `system-reminder` and
+  even the first words of the user's task, then a *different task* in the same project.
+  A new task shares the project preamble and nothing else. `41 150 / 149 771 = 27.5 %`,
+  which is exactly the `sim_best ≈ 0.3` the server logs for these.
+* **#5 vs #4, at char 3 149** — inside the `<tools>` block. #4's next tool definition is
+  `Edit`, #5's is `AskUserQuestion`. Two clients with **different tool sets**: the list
+  is alphabetical, so #4 simply lacks `AskUserQuestion`. Everything after token ~800 is
+  therefore a different sequence — for a 90k-token prompt that is the 139 s prefill.
+
+This interacts with how the fork identifies a conversation
+(`server-context.cpp:1760`):
+
+```cpp
+size_t hash_len = std::min(task_tokens.size(), (size_t)1024);
+task_conv_hash  = kv_ssd_hash_tokens(task_tokens.data(), hash_len);
+```
+
+The identity is the first **1024 tokens** — which on this client is entirely tool
+definitions. Consequences, both observed:
+
+* Every task in the same project with the same tool list gets the **same** `conv_hash`
+  and shares one SSD conversation directory. That is the `conv_hash match=1,
+  same_session=0` line: same hash, different session. 9 distinct `conv=` values over
+  21 h for many more tasks.
+* Changing the tool list at all — enabling an MCP server, a different agent type —
+  changes the identity and invalidates every checkpoint the old list produced.
+
+What follows for tuning: **nothing server-side.** Raising the tier budgets would not
+help, the hot tier never saturated (peak 6 978 of 8 192 MiB) and cold→hot promotions
+cost seconds, not minutes. The levers are on the client: keep the tool/MCP set
+identical across sessions, and expect one full prefill per genuinely new task.
+
+Note the SSD cache holds prompt *content* on disk by construction — it is serialized KV
+state of the tokens. `/nvme/llm/cachyllama-cache` (root-only, ~21 GiB) should be treated
+as containing everything the agent was ever sent.
+
 ## 5. Evidence tiers
 
 Metal-proven on 2× V100 (started, served requests, numbers taken from the server's own
