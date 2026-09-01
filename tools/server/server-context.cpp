@@ -851,6 +851,24 @@ static int process_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch
 // server_context_impl (private implementation)
 //
 
+// The SSD/prompt-cache machinery is purely token-based: conversation identity,
+// checkpoint prefixes and the system-prompt cache all hash a llama_tokens run.
+// A prompt carrying IMAGE/AUDIO chunks cannot be expressed that way, and
+// server_tokens::get_tokens() asserts (`GGML_ASSERT(!has_mtmd)`,
+// server-common.cpp:560) rather than return something lossy - correctly so.
+//
+// Every one of those sites therefore has to opt out instead of asking. Handing
+// back an empty run does that in one place: conv_hash stays 0, which every
+// consumer already reads as "no conversation" (see
+// server-context-page-manager.cpp:130), and the callers' existing empty checks
+// skip the rest. The cost is that an image turn is not cached - the same
+// reasoning the fork already applies to context shift at
+// `GGML_ASSERT(!slot.prompt.tokens.has_media())`, see issue #11.
+static const llama_tokens & cache_tokens_or_empty(const server_tokens & t) {
+    static const llama_tokens none;
+    return t.has_mtmd ? none : t.get_tokens();
+}
+
 struct server_context_impl {
     friend struct server_context;
 
@@ -1755,7 +1773,7 @@ private:
         // session starts fresh instead of being corrupted by stale context.
         uint64_t task_conv_hash = 0;
         {
-            const auto & task_tokens = task.tokens.get_tokens();
+            const auto & task_tokens = cache_tokens_or_empty(task.tokens);
             if (!task_tokens.empty()) {
                 size_t hash_len = std::min(task_tokens.size(), (size_t)1024);
                 task_conv_hash = kv_ssd_hash_tokens(
@@ -2247,7 +2265,7 @@ private:
         // stale context from the previous one.
         uint64_t task_conv_hash = 0;
         {
-            const auto & task_tokens = slot.task->tokens.get_tokens();
+            const auto & task_tokens = cache_tokens_or_empty(slot.task->tokens);
             size_t hash_len = std::min(task_tokens.size(), (size_t)1024);
             task_conv_hash = kv_ssd_hash_tokens(
                 (const uint32_t *)task_tokens.data(), hash_len);
@@ -2938,13 +2956,17 @@ private:
 
         // SSD-backed KV cache: store checkpoint on disk
         if (ssd_page_manager) {
-            const auto & prefix_tokens = slot.prompt.tokens;
-            ssd_page_manager->store_checkpoint_with_tokens(
-                slot.id, ctx_tgt, ctx_dft.get(), cur,
-                prefix_tokens.get_tokens().data(),
-                prefix_tokens.get_tokens().size(),
-                ssd_turn_counter, slot.conv_hash,
-                slot.task ? slot.task->user_id : std::string());
+            // Skip the store outright on a media turn: an empty token run would
+            // otherwise land a 0-token checkpoint in the index.
+            const auto & prefix_tokens = cache_tokens_or_empty(slot.prompt.tokens);
+            if (!prefix_tokens.empty()) {
+                ssd_page_manager->store_checkpoint_with_tokens(
+                    slot.id, ctx_tgt, ctx_dft.get(), cur,
+                    prefix_tokens.data(),
+                    prefix_tokens.size(),
+                    ssd_turn_counter, slot.conv_hash,
+                    slot.task ? slot.task->user_id : std::string());
+            }
         }
     }
 
@@ -3129,12 +3151,14 @@ private:
 
         if (ssd_page_manager) {
             const auto & prefix_tokens = slot.task
-                ? slot.task->tokens.get_tokens()
-                : slot.prompt.tokens.get_tokens();
-            ssd_page_manager->store_checkpoint_with_tokens(
-                slot.id, ctx_tgt, ctx_dft.get(), cur, prefix_tokens.data(),
-                prefix_tokens.size(), ssd_turn_counter, slot.conv_hash,
-                slot.task ? slot.task->user_id : std::string());
+                ? cache_tokens_or_empty(slot.task->tokens)
+                : cache_tokens_or_empty(slot.prompt.tokens);
+            if (!prefix_tokens.empty()) {
+                ssd_page_manager->store_checkpoint_with_tokens(
+                    slot.id, ctx_tgt, ctx_dft.get(), cur, prefix_tokens.data(),
+                    prefix_tokens.size(), ssd_turn_counter, slot.conv_hash,
+                    slot.task ? slot.task->user_id : std::string());
+            }
         }
     }
 
@@ -3153,7 +3177,7 @@ private:
             return;
         }
 
-        const auto & tokens = slot.task->tokens.get_tokens();
+        const auto & tokens = cache_tokens_or_empty(slot.task->tokens);
         if (tokens.empty()) {
             return;
         }
@@ -4052,7 +4076,7 @@ private:
                         // cold start: try per-conversation SSD checkpoint restore
                         // Must populate slot.prompt.tokens so get_common_prefix() finds the match
                         if (n_past == 0 && slot.prompt.n_tokens() == 0 && ssd_page_manager) {
-                            const auto & task_tokens = slot.task->tokens.get_tokens();
+                            const auto & task_tokens = cache_tokens_or_empty(slot.task->tokens);
                             if (!task_tokens.empty()) {
                                 int32_t ssd_pos_min = 0, ssd_pos_max = 0;
                                 uint64_t ssd_n_tokens = 0;
@@ -4231,7 +4255,7 @@ private:
                         // Warm slots (n_tokens > 0) already have full context from
                         // the in-memory prompt cache LCP restore or previous turn.
                         if (n_past == 0 && slot.prompt.n_tokens() == 0 && sys_cache && ssd_page_manager) {
-                            const auto & task_tokens = slot.task->tokens.get_tokens();
+                            const auto & task_tokens = cache_tokens_or_empty(slot.task->tokens);
                             int n_sys = kv_detect_system_prompt_boundary(
                                 llama_model_get_vocab(llama_get_model(ctx_tgt)),
                                 task_tokens.data(),
@@ -4589,7 +4613,7 @@ private:
                             // the first user message, shifting the boundary by tens of
                             // tokens between turns.
                             if (n_past == 0 && slot.prompt.n_tokens() > 0 && sys_cache && ssd_page_manager) {
-                                const auto & task_tokens = slot.task->tokens.get_tokens();
+                                const auto & task_tokens = cache_tokens_or_empty(slot.task->tokens);
                                 int n_sys = kv_detect_system_prompt_boundary(
                                     llama_model_get_vocab(llama_get_model(ctx_tgt)),
                                     task_tokens.data(),
