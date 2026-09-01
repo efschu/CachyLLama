@@ -709,6 +709,61 @@ buckets are never created, so this configuration cannot arise from client input 
 more. If you do see it, capture the log with `-lv 4` and check the `user_id check` /
 `n_past was set to` lines.
 
+### 4.10 What the cache achieves on 21 h of real agent traffic
+
+297 requests, 9 conversations, one slot, default verbosity — parsed from the server's
+own `print_timing` and `SSD cache` lines.
+
+| | |
+|---|---|
+| median prefill per request | **2.19 s** |
+| median share of the conversation reprocessed | **1.1 %** |
+| median `sim_best` at slot selection | **0.994** |
+| total prefill over 21 h | 37.1 min — **2.9 %** of wall time |
+| worst single request | **139 s** (83 231 tokens reprocessed) |
+
+So it is not a throughput problem, it is a latency tail. 49 of 297 requests (16 %)
+reprocessed more than 8k tokens. Classified by the log lines in the decision window
+immediately before each:
+
+| cause | n |
+|---|---|
+| client rewrote its own history (`sim_best < 0.6`) | **37** |
+| first visit to a conversation (`conversation boundary detected`, `no index file, starting fresh`) | 6 |
+| unclassified | 6 |
+
+The dominant case is not a cache failure. The line the server prints is unambiguous:
+
+```
+get_availabl: user_id check: task=<empty> slot=<empty>, conv_hash match=1, same_session=0 (f_keep=0.302)
+get_availabl: selected slot by LCP similarity, sim_best = 0.301 (> 0.100 thold), f_keep = 0.302
+```
+
+`conv_hash match=1` — same conversation — but only 30 % of the prompt still matches
+what the slot holds. The other 70 % are different tokens and have to be computed. 18 %
+of all slot selections look like this. 13.2 of the 37.1 prefill minutes are spent here.
+
+A tempting explanation is checkpoint granularity: on a hybrid model the recurrent state
+can only be rolled back to a checkpoint position (§4.1), so `--checkpoint-min-step 8192`
+could in principle waste up to 8191 already-matching tokens per divergence. **Measured,
+it does not.** Comparing tokens actually reused against `sim_best × conversation_length`
+over the 44 pairable cases gives a median gap of **300 tokens** — the reuse lands on the
+LCP itself. Do not lower `--checkpoint-min-step` for this; it buys nothing and costs
+writes.
+
+Two things worth knowing that fell out of the same audit:
+
+* The `warm` RAM tier peaked at **10 492 MiB** against its 8192 MiB budget — the tier
+  budgets are soft. Together with the in-memory checkpoint ring (observed 32/32 full,
+  median 251 MiB per entry ≈ **7.8 GiB**), caching holds roughly 18 GiB of host RAM at
+  peak on this box.
+* The hybrid rejection path added in §4.1 fired **0 times in 21 h**. Accepting only
+  full coverage costs nothing on this workload.
+
+With one slot (`-np 1`) requests queue. Do not benchmark against a live endpoint: a
+5k-token probe of mine showed 61 s wall while the server reported `total time = 2233 ms`
+for the same task — the difference was queue wait behind the agent's own traffic.
+
 ## 5. Evidence tiers
 
 Metal-proven on 2× V100 (started, served requests, numbers taken from the server's own
