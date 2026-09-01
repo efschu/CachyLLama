@@ -818,6 +818,93 @@ Note the SSD cache holds prompt *content* on disk by construction — it is seri
 state of the tokens. `/nvme/llm/cachyllama-cache` (root-only, ~21 GiB) should be treated
 as containing everything the agent was ever sent.
 
+### 4.12 Two aborts the loop fix uncovered, and one image bug that was always there
+
+Rejecting all partial coverage in §4.1 turned a branch that used to be nearly
+unreachable into the common path — `lcp_ratio` is `ssd_lcp / min(n_tokens, 4096)` with
+`ssd_lcp` capped at 4096, so it was essentially always 100 % and the old reject never
+fired. Two latent aborts sat behind it.
+
+**1. The system-prompt cache advanced `n_past` over an empty memory.**
+
+```
+cold-start: rejecting SSD checkpoint for hybrid model, partial coverage ...
+system prompt cache hit: hash=168d1b2dc2058b41, n_sys=23680
+n_past = 23680, slot.prompt.tokens.size() = 23680, seq_id = 0, pos_min = -1
+server-context.cpp:4429: pos_min == -1, but n_past > 0 - should not happen
+```
+
+`llama_state_seq_set_data_ext()` returns bytes consumed, not a guarantee. And on a
+hybrid model `LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY` **skips the attention KV outright**:
+
+```cpp
+// src/llama-memory-hybrid.cpp
+void llama_memory_hybrid::state_write(io, seq_id, flags) const {
+    if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
+        mem_attn->state_write(io, seq_id, flags);   // skipped
+    }
+    mem_recr->state_write(io, seq_id, flags);       // always
+}
+```
+
+So the blob is the recurrent state alone — measured, 157 MB for a 9 525-token system
+prompt, which is the GDN state size and nothing like a KV cache. The SSD checkpoint path
+survives the same flag because its attention pages come from the page manager; the
+system-prompt cache has no second half. The second restore site even claimed in a
+comment that the attention side "will be filled as prefill processes the remaining
+tokens" — prefill starts at `n_past`, so `[0, n_sys)` stays empty.
+
+Both sites now check `pos_min == 0 && pos_max >= n_sys - 1` against the memory before
+trusting the restore, and otherwise clear the sequence and cold-start. Verified the good
+path still works: `cache_n = 9524` on a 9 525-token system prompt, exactly `n_sys - 1`.
+
+**2. Every image request aborted — and this one predates the loop fix.**
+
+```
+server-common.cpp:560: GGML_ASSERT(!has_mtmd) failed   <- server_tokens::get_tokens()
+                                                       <- get_available_slot()
+server-common.cpp:524: GGML_ASSERT(has_mtmd)  failed   <- push_back_placeholder()
+                                                       <- update_slots()
+```
+
+Two halves of the same inconsistency. The fork stopped pre-flagging slots as multimodal
+(issue #11) because that made text-only requests assert — correct — and taught
+`push_back(chunk)` to set `has_mtmd` when a chunk is actually pushed. But:
+
+* the token-based cache machinery calls `get_tokens()` in eight places (conversation
+  identity in `get_available_slot()` and `launch_slot_with_task()`, the checkpoint prefix
+  in `create_checkpoint()` and `deferred_create_final_checkpoint()`, the system-prompt
+  cache in `maybe_extract_system_prompt()` and both cold-start restore sites, and the
+  cold-start SSD restore) and `get_tokens()` refuses a container holding media. All eight
+  now go through `cache_tokens_or_empty()`, which returns an empty run for a media
+  prompt: `conv_hash` stays 0, every consumer already reads that as "no conversation",
+  and the existing empty checks skip the rest. An image turn is simply not cached.
+* `push_back_placeholder()` was left *asserting* the flag nothing sets any more, so it
+  fired on the first image chunk of every request. It now sets it, like
+  `push_back(chunk)` does.
+
+`push_back(server_tokens &)` had the same assert plus a loop that never incremented its
+iterator and looked the source chunk up by key instead of using `it->second` — it would
+have spun forever the first time it copied media. Fixed alongside.
+
+Verified on metal against the same prompts upstream answers, positive control first:
+
+| | `d222582` (pre-fix) | `bf7ed3a9` | upstream b10236 |
+|---|---|---|---|
+| image (solid red PNG) | **Exited 139** at `server-common.cpp:560` | `Red` | `Red` |
+| image (solid blue PNG) | — | `Blue` | `Blue` |
+| text after an image | — | `OK-TEXT` | — |
+| 10 582-token text, repeated | — | `prompt_n = 1`, `cache_n = 10581` | — |
+| tools + streaming | — | 28 chunks, tool call seen | — |
+| aborts | 1 per image | **0** | 0 |
+
+Caveat on the first abort: the specific combination that produced it (a partial-LCP
+cold start whose conversation had already lost its system-prompt-boundary checkpoint)
+could not be reproduced synthetically — `find_match()` scores a full match 2 against a
+partial 1, and the boundary checkpoint is a full match, so partial never wins until that
+checkpoint has been evicted. The guard makes the abort unreachable by construction; that
+is the tier it holds.
+
 ## 5. Evidence tiers
 
 Metal-proven on 2× V100 (started, served requests, numbers taken from the server's own
