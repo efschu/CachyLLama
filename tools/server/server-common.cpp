@@ -521,7 +521,12 @@ void server_tokens::push_back(const mtmd_input_chunk * chunk) {
 void server_tokens::push_back_placeholder(const mtmd_input_chunk * chunk) {
     auto type = mtmd_input_chunk_get_type(chunk);
     if (type == MTMD_INPUT_CHUNK_TYPE_IMAGE || type == MTMD_INPUT_CHUNK_TYPE_AUDIO) {
-        GGML_ASSERT(has_mtmd);
+        // Inserting a media placeholder makes this container hold media, so set
+        // the flag the same way push_back(chunk) above does. Asserting it was
+        // already set is the other half of the issue #11 change that stopped
+        // pre-flagging slots on multimodal models: nothing sets it any more, so
+        // this fired on the first image chunk of every request.
+        has_mtmd = true;
         mtmd::input_chunk_ptr new_chunk(mtmd_input_chunk_get_placeholder(chunk));
         GGML_ASSERT(new_chunk != nullptr && "failed to create placeholder chunk");
         const size_t n_tokens = mtmd_input_chunk_get_n_tokens(chunk);
@@ -541,11 +546,12 @@ void server_tokens::push_back(server_tokens & tokens) {
         push_back(tokens[i]);
     }
     if (tokens.has_mtmd) {
-        // Assert if we are copying MTMD chunks to a server_tokens that does not have mtmd.
-        // We could also just check, but this will prevent silently dropping MTMD data.
-        GGML_ASSERT(has_mtmd);
-        for (auto it = tokens.map_idx_to_media.begin(); it != tokens.map_idx_to_media.end(); ) {
-            auto * chunk = tokens.map_idx_to_media[it->first].get();
+        // Copying MTMD chunks in makes this container hold media. The old assert
+        // guarded against silently dropping the data; setting the flag keeps it,
+        // which is what the caller wanted, and matches push_back(chunk).
+        has_mtmd = true;
+        for (auto it = tokens.map_idx_to_media.begin(); it != tokens.map_idx_to_media.end(); ++it) {
+            auto * chunk = it->second.get();
             mtmd::input_chunk_ptr new_chunk(mtmd_input_chunk_copy(chunk));
             map_idx_to_media[start_idx + it->first] = std::move(new_chunk);
         }
