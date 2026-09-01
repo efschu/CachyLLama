@@ -1,6 +1,6 @@
 services:
   llama-cpp-qwen36-27b-dual-mtp-vision:
-    image: cachyllama:server-cuda-5256204-sm70-v100
+    image: cachyllama:server-cuda-bf7ed3a9-sm70-v100
     container_name: "${ESTATE_CONTAINER:-llama-cpp-qwen36-27b-cachyllama-nossd}"
     shm_size: 16384mb
     restart: no
