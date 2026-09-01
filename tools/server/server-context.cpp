@@ -4258,18 +4258,43 @@ private:
                                     // to read attention data that isn't there.
                                     if (llama_state_seq_set_data_ext(ctx_tgt, sys_data.data(),
                                             sys_data.size(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) > 0) {
-                                        n_past = n_sys;
+                                        // set_data_ext reports bytes consumed, not that a usable
+                                        // prefix now exists. On a hybrid model PARTIAL_ONLY skips
+                                        // the attention KV outright - see
+                                        // llama_memory_hybrid::state_write() - so this blob is the
+                                        // recurrent state and nothing else. Advancing n_past over
+                                        // it claims [0, n_sys) is cached while the attention cells
+                                        // are empty, and pre_decode then aborts on
+                                        // "pos_min == -1, but n_past > 0".
+                                        //
+                                        // The SSD checkpoint path gets away with the same flag
+                                        // because its attention pages come from the page manager.
+                                        // This one has no such second half, so verify against the
+                                        // memory instead of trusting the byte count.
+                                        auto * mem_sys = llama_get_memory(ctx_tgt);
+                                        const auto sys_pos_min = llama_memory_seq_pos_min(mem_sys, slot.id);
+                                        const auto sys_pos_max = llama_memory_seq_pos_max(mem_sys, slot.id);
+                                        if (sys_pos_min == 0 && sys_pos_max >= n_sys - 1) {
+                                            n_past = n_sys;
 
-                                        // Populate slot.prompt.tokens so get_common_prefix()
-                                        // finds the match and preserves n_past. Without this,
-                                        // get_common_prefix() returns 0 on empty tokens and
-                                        // the restored state is wiped by seq_rm(ctx, 0, -1).
-                                        for (int32_t i = 0; i < n_sys; i++) {
-                                            slot.prompt.tokens.push_back(task_tokens[i]);
+                                            // Populate slot.prompt.tokens so get_common_prefix()
+                                            // finds the match and preserves n_past. Without this,
+                                            // get_common_prefix() returns 0 on empty tokens and
+                                            // the restored state is wiped by seq_rm(ctx, 0, -1).
+                                            for (int32_t i = 0; i < n_sys; i++) {
+                                                slot.prompt.tokens.push_back(task_tokens[i]);
+                                            }
+
+                                            SLT_INF(slot, "system prompt cache hit: hash=%016lx, n_sys=%d\n",
+                                                    sys_hash, n_sys);
+                                        } else {
+                                            SLT_WRN(slot, "system prompt cache entry restored no usable [0,%d) "
+                                                    "prefix (pos_min=%d pos_max=%d) - cold start instead\n",
+                                                    n_sys, (int) sys_pos_min, (int) sys_pos_max);
+                                            llama_memory_seq_rm(mem_sys, slot.id, -1, -1);
+                                            n_past = 0;
+                                            slot.prompt.tokens.clear();
                                         }
-
-                                        SLT_INF(slot, "system prompt cache hit: hash=%016lx, n_sys=%d\n",
-                                                sys_hash, n_sys);
                                     }
                                 }
                             }
@@ -4614,22 +4639,35 @@ private:
                                 if (recovered) {
                                     if (llama_state_seq_set_data_ext(ctx_tgt, sys_data.data(),
                                             sys_data.size(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) > 0) {
-                                        n_past = recovered_n_sys;
-                                        pos_next = recovered_n_sys;
-                                        // Replace stale tokens from the previous turn with
-                                        // the new task's first n_sys tokens. Stale tokens
-                                        // would corrupt the prefill loop after n_past jumps.
-                                        slot.prompt.tokens.keep_first(0);
-                                        for (int32_t i = 0; i < recovered_n_sys; i++) {
-                                            slot.prompt.tokens.push_back(task_tokens[i]);
+                                        // Same verification as the cold-start site above. The
+                                        // comment that used to sit here argued the attention side
+                                        // "will be filled as prefill processes the remaining
+                                        // tokens" - it will not: prefill starts at n_past, so
+                                        // [0, n_sys) would stay empty for the whole request.
+                                        auto * mem_sys = llama_get_memory(ctx_tgt);
+                                        const auto sys_pos_min = llama_memory_seq_pos_min(mem_sys, slot.id);
+                                        const auto sys_pos_max = llama_memory_seq_pos_max(mem_sys, slot.id);
+                                        if (sys_pos_min == 0 && sys_pos_max >= recovered_n_sys - 1) {
+                                            n_past   = recovered_n_sys;
+                                            pos_next = recovered_n_sys;
+                                            // Replace stale tokens from the previous turn with
+                                            // the new task's first n_sys tokens. Stale tokens
+                                            // would corrupt the prefill loop after n_past jumps.
+                                            slot.prompt.tokens.keep_first(0);
+                                            for (int32_t i = 0; i < recovered_n_sys; i++) {
+                                                slot.prompt.tokens.push_back(task_tokens[i]);
+                                            }
+                                            slot.ssd_cold_start_used = true;
+                                            SLT_DBG(slot, "[PROBE] sys-cache-fallback n_past=%d (n_sys=%d) after do_reset\n",
+                                                    n_past, recovered_n_sys);
+                                        } else {
+                                            SLT_WRN(slot, "sys-cache fallback restored no usable [0,%d) prefix "
+                                                    "(pos_min=%d pos_max=%d) - cold start instead\n",
+                                                    recovered_n_sys, (int) sys_pos_min, (int) sys_pos_max);
+                                            llama_memory_seq_rm(mem_sys, slot.id, -1, -1);
+                                            n_past = 0;
+                                            slot.prompt.tokens.keep_first(0);
                                         }
-                                        // Route seq_rm through seq_rm_attn_only so the loaded
-                                        // recurrent state is preserved (attention is empty for
-                                        // the system section and will be filled as prefill
-                                        // processes the remaining tokens).
-                                        slot.ssd_cold_start_used = true;
-                                        SLT_DBG(slot, "[PROBE] sys-cache-fallback n_past=%d (n_sys=%d) after do_reset\n",
-                                                n_past, recovered_n_sys);
                                     }
                                 }
                             }
