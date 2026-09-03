@@ -1,6 +1,6 @@
 services:
   llama-cpp-qwen36-27b-dual-mtp-vision:
-    image: cachyllama:server-cuda-b2dadc5c-sm70-v100
+    image: cachyllama:server-cuda-020fef5e-sm70-v100
     container_name: "${ESTATE_CONTAINER:-llama-cpp-qwen36-27b-cachyllama-nossd}"
     shm_size: 16384mb
     restart: unless-stopped
@@ -16,6 +16,7 @@ services:
       -m /models/huihui-ai/Huihui-Qwen3.8-27B-abliterated-GGUF/Huihui-Qwen3.8-27B-abliterated-Q6_K.gguf
       --mmproj /models/huihui-ai/Huihui-Qwen3.8-27B-abliterated-GGUF/mmproj-F16.gguf
       --no-mmproj-offload
+      --mmproj-vram-swap
       --image-min-tokens ${IMAGE_MIN_TOKENS:-1024}
       --image-max-tokens ${IMAGE_MAX_TOKENS:-1024}
       -c 150000
