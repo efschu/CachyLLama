@@ -8,11 +8,13 @@ the recurrent cache back further than n_rs_seq. If the checkpoint-recovery gate
 is inverted, that rollback silently drops the recurrent state.
 
 Positive control = looping build. Expect DEGENERATE verdicts.
+
+Usage: [LLAMA_HOST=<host>] ./looptest.py [port]
 """
-import json, sys, urllib.request, re, collections
+import collections, json, os, re, sys, urllib.request
 
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8064
-HOST = "192.168.22.238"
+HOST = os.environ.get("LLAMA_HOST", "127.0.0.1")
 
 # ~30k tokens of unique-ish context so long-range recurrent state actually matters
 DOC = "".join(
