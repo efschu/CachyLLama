@@ -4272,29 +4272,32 @@ private:
                                     (const uint32_t*)task_tokens.data(), (size_t)n_sys);
 
                                 std::vector<uint8_t> sys_data;
-                                if (sys_cache->load((const uint32_t*)task_tokens.data(),
+                                // A PARTIAL_ONLY blob is recurrent-state-only on a hybrid
+                                // memory: llama_memory_hybrid::state_write() writes mem_attn
+                                // only when the flag is clear, and the store side
+                                // (maybe_extract_system_prompt) sets it. Restoring it therefore
+                                // cannot produce a usable prefix - the attention cells stay
+                                // empty, so llama_memory_seq_pos_max(), which is
+                                // min(attn_max, recr_max), reports -1 and nothing may advance
+                                // n_past over it. Attempting the load anyway would only
+                                // overwrite the recurrent state the sequence already holds, so
+                                // skip it before touching the memory.
+                                //
+                                // Making the cache work for these models needs the attention
+                                // half in the blob, i.e. a stored-format change. Out of scope.
+                                const bool sys_restorable =
+                                    ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_RS;
+                                if (!sys_restorable) {
+                                    SLT_DBG(slot, "system prompt cache: skipping restore, a "
+                                            "recurrent-only state cannot supply [0,%d)\n", n_sys);
+                                } else if (sys_cache->load((const uint32_t*)task_tokens.data(),
                                                     (uint32_t)n_sys, sys_data)) {
-                                    // Restore system prompt state from cache
-                                    // Match the save flag (PARTIAL_ONLY) used by
-                                    // maybe_extract_system_prompt(). The system prompt
-                                    // cache only stores recurrent memory state, not
-                                    // attention KV cache. Loading with NONE would try
-                                    // to read attention data that isn't there.
                                     if (llama_state_seq_set_data_ext(ctx_tgt, sys_data.data(),
                                             sys_data.size(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) > 0) {
                                         // set_data_ext reports bytes consumed, not that a usable
-                                        // prefix now exists. On a hybrid model PARTIAL_ONLY skips
-                                        // the attention KV outright - see
-                                        // llama_memory_hybrid::state_write() - so this blob is the
-                                        // recurrent state and nothing else. Advancing n_past over
-                                        // it claims [0, n_sys) is cached while the attention cells
-                                        // are empty, and pre_decode then aborts on
-                                        // "pos_min == -1, but n_past > 0".
-                                        //
-                                        // The SSD checkpoint path gets away with the same flag
-                                        // because its attention pages come from the page manager.
-                                        // This one has no such second half, so verify against the
-                                        // memory instead of trusting the byte count.
+                                        // prefix now exists. Verify against the memory before
+                                        // advancing n_past; on failure leave the slot untouched
+                                        // and let the normal cold-start path handle it.
                                         auto * mem_sys = llama_get_memory(ctx_tgt);
                                         const auto sys_pos_min = llama_memory_seq_pos_min(mem_sys, slot.id);
                                         const auto sys_pos_max = llama_memory_seq_pos_max(mem_sys, slot.id);
@@ -4315,9 +4318,6 @@ private:
                                             SLT_WRN(slot, "system prompt cache entry restored no usable [0,%d) "
                                                     "prefix (pos_min=%d pos_max=%d) - cold start instead\n",
                                                     n_sys, (int) sys_pos_min, (int) sys_pos_max);
-                                            llama_memory_seq_rm(mem_sys, slot.id, -1, -1);
-                                            n_past = 0;
-                                            slot.prompt.tokens.clear();
                                         }
                                     }
                                 }
@@ -4627,32 +4627,28 @@ private:
                                 std::vector<uint8_t> sys_data;
                                 bool recovered = false;
 
-                                if (n_sys >= MIN_USEFUL_SYS_TOKENS && n_sys < (int32_t)task_tokens.size()) {
+                                // As at the cold-start site above: on a hybrid memory the stored
+                                // blob is recurrent-state-only, so nothing restored from it can
+                                // carry [0, n_sys). Here the slot is still holding the previous
+                                // turn's state, so attempting the load would overwrite it for
+                                // nothing - skip before touching the memory.
+                                const bool sys_restorable =
+                                    ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_RS;
+
+                                if (sys_restorable && n_sys >= MIN_USEFUL_SYS_TOKENS &&
+                                        n_sys < (int32_t)task_tokens.size()) {
                                     if (sys_cache->load((const uint32_t*)task_tokens.data(),
                                                         (uint32_t)n_sys, sys_data)) {
                                         recovered_n_sys = n_sys;
                                         recovered = true;
-                                    } else if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_RS &&
-                                               (uint32_t)n_sys >= MIN_PREFIX_MATCH &&
+                                    } else if ((uint32_t)n_sys >= MIN_PREFIX_MATCH &&
                                                sys_cache->load_prefix((const uint32_t*)task_tokens.data(),
                                                        (uint32_t)n_sys, MIN_PREFIX_MATCH, sys_data)) {
-                                        // Prefix fallback: the entry matched on its first
-                                        // MIN_PREFIX_MATCH tokens only, so beyond that its tokens
-                                        // may differ from this task's. The old comment here argued
-                                        // the resulting "state drift is bounded by the small
-                                        // divergent region at the boundary" - that is not true for
-                                        // a recurrent state, which is one tensor folded over every
-                                        // token, so a divergence anywhere changes it completely and
-                                        // there is no bounded error. Restoring it and then claiming
-                                        // n_past = n_sys hands the model a state describing another
-                                        // conversation.
-                                        //
-                                        // Disabled for recurrent/hybrid contexts. Note it remains
-                                        // questionable for dense models too - their KV cells would
-                                        // hold the stored entry's keys/values while the server
-                                        // believes the positions hold this task's tokens - but that
-                                        // failure degrades rather than wedges, and changing it is
-                                        // out of scope here.
+                                        // Prefix fallback matched: the entry agrees on its first
+                                        // MIN_PREFIX_MATCH tokens, and the divergent tail is
+                                        // accepted as approximate. Only reached for non-recurrent
+                                        // memories now - a recurrent state is one tensor folded
+                                        // over every token, so "approximate" does not apply to it.
                                         recovered_n_sys = n_sys;
                                         recovered = true;
                                         SLT_DBG(slot, "[PROBE] sys-cache-fallback prefix-match recovered at n_sys=%d (exact match failed)\n",
@@ -4685,12 +4681,12 @@ private:
                                             SLT_DBG(slot, "[PROBE] sys-cache-fallback n_past=%d (n_sys=%d) after do_reset\n",
                                                     n_past, recovered_n_sys);
                                         } else {
+                                            // Leave n_past at 0 and the slot as it is; the normal
+                                            // truncation and checkpoint-recovery path below owns
+                                            // the cleanup.
                                             SLT_WRN(slot, "sys-cache fallback restored no usable [0,%d) prefix "
                                                     "(pos_min=%d pos_max=%d) - cold start instead\n",
                                                     recovered_n_sys, (int) sys_pos_min, (int) sys_pos_max);
-                                            llama_memory_seq_rm(mem_sys, slot.id, -1, -1);
-                                            n_past = 0;
-                                            slot.prompt.tokens.keep_first(0);
                                         }
                                     }
                                 }
